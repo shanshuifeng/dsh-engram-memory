@@ -6,6 +6,8 @@
  */
 
 import { createHash } from 'node:crypto'
+import { gateDomains, renderDomainIndex } from './domain-gate.ts'
+import { loadDomainRegistry, mergeDomainDescriptors } from './domain-registry.ts'
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -341,8 +343,20 @@ async function preStep(
   const store = await openStore('user')
   // curated block：engram_profile_edit 维护的画像段，优先于自动派生画像注入。
   const curated = await store.getProfileBlock('user')
-  const top = await store.topActive('user', resolved.profileTopN)
-  if (top.length === 0 && curated === undefined) return decision
+  // 领域门控（schema v14）：先按当前请求判定激活哪些方向，再决定注入哪些条目。
+  // 关闭门控（默认）时 activeDomains 为空 → 走 topActive，行为与升级前完全一致。
+  const counts = await store.domainCounts()
+  const registry = await loadDomainRegistry(resolved.dbDir)
+  const descriptors = mergeDomainDescriptors(registry, counts)
+  const gate = gateDomains(currentUserRequestText(decision.messages), descriptors, resolved.domainGating)
+  const top = gate.active.length === 0
+    ? await store.topActive('user', resolved.profileTopN)
+    : await store.topActiveByDomain('user', resolved.profileTopN, gate.active)
+  if (top.length === 0 && curated === undefined) {
+    // 领域门控把候选清空时也不能整体跳过：目录行仍需注入，否则模型永远不知道
+    // 存在哪些方向（L1 目录是门控可用性的前提）。仅在确实无任何领域条目时早退。
+    if (descriptors.filter(d => (d.count ?? 0) > 0 && d.name !== 'general').length === 0) return decision
+  }
   // 今日待回忆提示（检索练习调度）：有到期条目时在画像末尾附一行，引导 agent 主动自测。
   // user + project 两库合并计数；50 为计数上限（超过显示 50+）。
   const dueTotal = resolved.reviewScheduling
@@ -394,7 +408,11 @@ async function preStep(
   const dueLine = dueTotal === 0
     ? ''
     : message('core.reviewDue', { count: dueTotal, plus: dueTotal >= 50 ? '+' : '' })
+  // L1 领域目录：门控开启时附上「有哪些方向」，让模型知道可以主动深入；
+  // 门控关闭时不改动既有注入文本（保持升级前行为与 hash 稳定性）。
+  const domainIndex = resolved.domainGating ? renderDomainIndex(descriptors, resolved.language) : ''
   const textWithRationale = wrapWithRationale(text, top) + dueLine
+    + (domainIndex === '' ? '' : `\n\n${domainIndex}`)
   const hash = createHash('sha256').update(textWithRationale).digest('hex')
   if (state.lastProfileAgent === String(agent.id) && hash === state.lastProfileHash) return decision
   state.lastProfileAgent = String(agent.id)
@@ -841,6 +859,7 @@ export function apply(ctx: Context, config: EngramConfig = {}): void {
     ...resolveJevField(resolved.jev, resolved.dbDir),
     queryRewrite: resolved.queryRewrite,
     exportDir: `${resolved.dbDir}/exports`,
+    dbDir: resolved.dbDir,
     language: resolved.language,
     historyBackfill: { estimate: historyApi.estimate, run: historyApi.run },
   })) {

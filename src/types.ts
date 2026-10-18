@@ -50,6 +50,32 @@ export function isSharedScope(scope: EngramScope): boolean {
 /** 记忆种类：fact 事实 / preference 偏好 / decision 决策 / episode 经历 / skill 方法。 */
 export type EngramKind = 'fact' | 'preference' | 'decision' | 'episode' | 'skill'
 
+/**
+ * 记忆领域：知识方向的一等公民（schema v14）。
+ *
+ * 与 scope / kind 正交：
+ * - scope 决定「存在哪个宫殿」（私人/项目/共享）；
+ * - kind 决定「是什么类型」（事实/技能/决策…）；
+ * - domain 决定「属于哪个知识方向」（UE5、数据挖掘、通用…）。
+ *
+ * 领域用于两件事：
+ * 1. 检索时按领域收窄（engram_search 的 domain 参数）；
+ * 2. 会话注入时按当前会话命中的领域门控（domain 门控，见 injection）。
+ *
+ * `general` 是特殊值：表示跨领域通用知识（如用户工作方式偏好），
+ * 这类条目不受领域门控限制，始终参与注入。
+ */
+export type EngramDomain = string
+
+/** 通用领域：跨方向适用的记忆，不参与领域门控（始终可注入）。 */
+export const GENERAL_DOMAIN = 'general' as const
+
+/** 判断是否为通用领域（undefined 视为通用，兼容 v14 之前的存量条目）。 */
+export function isGeneralDomain(domain: EngramDomain | undefined): boolean {
+  return domain === undefined || domain === GENERAL_DOMAIN || domain === ''
+}
+
+
 /** 条目状态：active 参与检索；archived（衰减/被取代）不参与检索、可恢复；forgotten 软删、可恢复。 */
 export type EngramStatus = 'active' | 'archived' | 'forgotten'
 
@@ -107,6 +133,11 @@ export interface MemoryRecord {
   readonly scope: EngramScope
   readonly kind: EngramKind
   readonly content: string
+  /**
+   * 知识领域（schema v14 起）：`general` 或具体方向名（ue5 / datamining / ml …）。
+   * undefined = 存量条目未分类，按 general 处理（不受门控限制）。
+   */
+  readonly domain?: EngramDomain
   /** 0-1：重要性，影响注入排序与衰减调度。 */
   readonly importance: number
   /** 0-1：置信度，命中强化提升、蒸馏失败回退。 */
@@ -251,6 +282,8 @@ export interface WriteInput {
   readonly scope: EngramScope
   readonly kind: EngramKind
   readonly content: string
+  /** 知识领域（schema v14 起）；缺省 = general（跨方向通用，不受门控限制）。 */
+  readonly domain?: EngramDomain
   readonly importance?: number
   readonly confidence?: number
   readonly sourceSessionId?: string | null
@@ -279,6 +312,11 @@ export interface SearchQuery {
    * 缺省全库检索；未排桩（slot_room 为空）的条目不属于任何房间，指定 rooms 时不出现。
    */
   readonly rooms?: readonly string[]
+  /**
+   * 领域收窄（schema v14 起）：只在指定领域内检索；指定时 `general` 条目仍会返回
+   * （通用知识对所有方向都成立）。缺省不按领域过滤。
+   */
+  readonly domains?: readonly string[]
 }
 
 /** 一条检索命中。 */
@@ -366,6 +404,8 @@ export interface UpdateInput {
   readonly scope: EngramScope
   readonly kind: EngramKind
   readonly content: string
+  /** 领域：缺省继承旧条目。 */
+  readonly domain?: EngramDomain
   readonly importance?: number
   /** 新内容向量；缺省时继承旧条目向量。 */
   readonly embedding?: Float32Array
@@ -527,6 +567,8 @@ export interface ListFilter {
   readonly q?: string
   /** 脱敏标记过滤：true 只看含 `[REDACTED:` 的条目，false 只看不含的；缺省不过滤。 */
   readonly redacted?: boolean
+  /** 领域过滤（schema v14 起）：只看指定领域；缺省不过滤。 */
+  readonly domain?: EngramDomain
   /** 排序：缺省 created_at 倒序；'tour' = 按固定巡游路线桩位顺序（未上路线者按创建时间排末尾）。 */
   readonly sort?: 'tour'
   readonly limit: number

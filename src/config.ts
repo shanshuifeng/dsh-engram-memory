@@ -84,6 +84,12 @@ export interface EngramConfig {
   autoSlot?: boolean
   /** 新记忆是否进入 SM-2 间隔重复调度（初始 1 天后到期）；默认 true。false 时复习队列恒空、decay 行为同旧版。 */
   reviewScheduling?: boolean
+  /**
+   * 领域门控：会话开始时只注入 general 领域 + 当前请求命中的领域条目。
+   * 默认 false（行为与升级前一致：全量按 importance 注入）。
+   * 开启后未命中的领域内容不进上下文，模型可用 engram_search 的 domains 参数主动拉取。
+   */
+  domainGating?: boolean
   /** 历史回填默认规则：时间窗天数，0 = 不限；默认 7。 */
   historyBackfillDays?: number
   /** 历史回填默认规则：单个会话最多摄取轮数；默认 20。 */
@@ -164,6 +170,8 @@ export interface ResolvedEngramConfig {
   readonly queryRewrite: boolean
   readonly autoSlot: boolean
   readonly reviewScheduling: boolean
+  /** 领域门控：开启后注入按当前请求命中的领域收窄（默认关）。 */
+  readonly domainGating: boolean
   /** 历史回填默认规则（历史会话 → 记忆宫殿的一次性/按需回填）。 */
   readonly historyBackfill: ResolvedHistoryRules
   /** Jev System One 裁决子配置（默认关闭）。 */
@@ -180,7 +188,7 @@ const CONFIG_KEYS: ReadonlySet<string> = new Set([
   'ingest', 'reflect', 'provider', 'model', 'decayAfterDays', 'decayImportanceBelow',
   'injectTokenBudget', 'injectItemBudgetStart', 'injectItemBudgetDecay', 'injectItemBudgetFloor',
   'rankRecencyWeight', 'rankProofWeight', 'queryRewrite',
-  'autoSlot', 'reviewScheduling', 'assessReminder',
+  'autoSlot', 'reviewScheduling', 'assessReminder', 'domainGating',
   'historyBackfillDays', 'historyBackfillMaxTurnsPerSession', 'historyBackfillMaxTotalTurns',
   'historyBackfillIncludeSubagents', 'historyBackfillIncludeSeeded', 'historyBackfillIncludeNoCwd',
   'jev', 'language', 'redactWords',
@@ -212,6 +220,7 @@ export const Config: z<EngramConfig> = z.object({
   queryRewrite: z.boolean(),
   autoSlot: z.boolean(),
   reviewScheduling: z.boolean(),
+  domainGating: z.boolean(),
   assessReminder: z.boolean(),
   historyBackfillDays: z.number().step(1).min(0).max(3650),
   historyBackfillMaxTurnsPerSession: z.number().step(1).min(1).max(500),
@@ -356,6 +365,7 @@ export function resolveConfig(config: EngramConfig = {}): ResolvedEngramConfig {
     queryRewrite: config.queryRewrite ?? true,
     autoSlot: config.autoSlot ?? true,
     reviewScheduling: config.reviewScheduling ?? true,
+    domainGating: config.domainGating ?? false,
     historyBackfill: {
       days: config.historyBackfillDays ?? 7,
       maxTurnsPerSession: config.historyBackfillMaxTurnsPerSession ?? 20,

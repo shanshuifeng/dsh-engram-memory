@@ -38,6 +38,7 @@ import type { MemoryJudge, WriteDisposition } from '../write-disposition.ts'
 import type { EngramLanguage } from '../i18n/language.ts'
 import { message } from '../i18n/messages.ts'
 import { resolveRoomInput, roomLabel } from '../i18n/rooms.ts'
+import { loadDomainRegistry, mergeDomainDescriptors, saveDomainRegistry } from '../domain-registry.ts'
 
 /** 工具依赖：分库打开器、嵌入器承诺、辅助 LLM 调用与导出目录。 */
 export interface ToolDeps {
@@ -60,6 +61,8 @@ export interface ToolDeps {
   readonly queryRewrite: boolean
   /** 导出文件目录（engram_export 写入）。 */
   readonly exportDir: string
+  /** 记忆库根目录（domains.json 领域注册表落在此目录，随库一起备份转移）。 */
+  readonly dbDir: string
   /**
    * Язык текстов, которые формирует плагин (имена комнат, сообщения инструментов).
    * Приходит из разобранной конфигурации: «auto» там уже развёрнут в язык системы.
@@ -219,6 +222,17 @@ function renderAssessText(verdict: AssessVerdict, batchId: string): string {
 function scopeOf(raw: unknown, fallback: EngramScope): EngramScope {
   if (raw === 'user' || raw === 'project' || raw === 'shared') return raw
   return fallback
+}
+
+/**
+ * 从模型参数收敛领域名（schema v14）。
+ * 收敛规则：trim + 小写 + 空格转连字符；空串/非字符串 → undefined（= general）。
+ * 不做白名单校验——领域是开放的（新方向随时可加），由注册表与实库聚合驱动。
+ */
+function domainOf(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const normalized = raw.trim().toLowerCase().replace(/\s+/g, '-')
+  return normalized === '' ? undefined : normalized
 }
 
 /** 把 search scope 参数收敛为分库集合。 */
@@ -544,6 +558,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
       scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.scopeDescriptionProject') },
       importance: { type: 'number', description: message('tool.saveImportanceDescription') },
       placard: { type: 'string', description: message('tool.savePlacardDescription') },
+      domain: { type: 'string', description: message('tool.saveDomainDescription') },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -574,7 +589,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
       render: (_args, value) => [{ type: 'text', text: renderSaveResultText(value as SaveResultView) }],
     },
     async execute(args, exec) {
-      const input = args as { content?: unknown; kind?: unknown; entities?: unknown; items?: unknown; scope?: unknown; importance?: unknown; placard?: unknown }
+      const input = args as { content?: unknown; kind?: unknown; entities?: unknown; items?: unknown; scope?: unknown; importance?: unknown; placard?: unknown; domain?: unknown }
       const sourceSessionId = exec.agent?.id ?? null
       // 批量模式：items 与 content/kind 互斥，同传 loud 失败。
       if (input.items !== undefined) {
@@ -603,6 +618,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
         kind: input.kind as EngramKind,
         content,
         ...(typeof input.importance === 'number' ? { importance: input.importance } : {}),
+        ...(domainOf(input.domain) === undefined ? {} : { domain: domainOf(input.domain)! }),
         sourceSessionId,
         ...(embeddings?.[0] === undefined ? {} : { embedding: embeddings[0] }),
         ...(imagery === undefined ? {} : { imagery }),
@@ -657,6 +673,11 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
       query: { type: 'string', required: true, description: message('tool.searchQueryDescription') },
       scope: { type: 'string', enum: ['user', 'project', 'shared', 'all'], description: message('tool.scopeDescriptionAll') },
       room: { type: 'string', description: message('tool.searchRoomDescription') },
+      domains: {
+        type: 'array',
+        items: { type: 'string' },
+        description: message('tool.searchDomainsDescription'),
+      },
       limit: { type: 'number', description: message('tool.searchLimitDescription') },
       asOf: { type: 'string', description: message('tool.searchAsOfDescription') },
     },
@@ -668,10 +689,14 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
       render: (_args, value) => [{ type: 'text', text: value.text }],
     },
     async execute(args, exec) {
-      const input = args as { query: string; scope?: unknown; room?: unknown; limit?: number; asOf?: unknown }
+      const input = args as { query: string; scope?: unknown; room?: unknown; domains?: unknown; limit?: number; asOf?: unknown }
       const scopes = scopesOf(input.scope)
       const rooms = typeof input.room === 'string' && input.room.trim() !== ''
         ? [resolveRoomInput(input.room) ?? input.room.trim()]
+        : undefined
+      // 领域收窄（schema v14）：数组里逐项归一；general 条目由存储层无条件放行。
+      const domains = Array.isArray(input.domains)
+        ? input.domains.map(domainOf).filter((d): d is string => d !== undefined)
         : undefined
       const limit = input.limit ?? 8
       const asOfMs = parseTimeParam(typeof input.asOf === 'string' ? input.asOf : undefined, 'engram_search', 'asOf')
@@ -683,7 +708,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
         const vector = await queryVectorOf(deps, queryText)
         const results = await Promise.all(scopes.map(async (scope) => {
           const store = await deps.openStore(scope)
-          return store.search({ text: queryText, scopes: [scope], limit, ...(rooms === undefined ? {} : { rooms }) }, vector)
+          return store.search({ text: queryText, scopes: [scope], limit, ...(rooms === undefined ? {} : { rooms }), ...(domains === undefined || domains.length === 0 ? {} : { domains }) }, vector)
         }))
         return {
           hits: results.flatMap(result => result.hits).sort((a, b) => b.score - a.score).slice(0, limit),
@@ -1129,8 +1154,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
   })
 
   const update = defineTool({
-    name: 'engram_update',
-    description: message('tool.updateDescription'),
+    name: 'engram_update',    description: message('tool.updateDescription'),
     parameters: {
       id: { type: 'string', required: true, description: message('tool.updateIdDescription') },
       content: { type: 'string', required: true, description: message('tool.updateContentDescription') },
@@ -1196,6 +1220,80 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
       const store = await deps.openStore(scope)
       const record = await store.forgetWithTombstone(input.id as never, { reason, affects, stillUseful })
       return { id: record.id }
+    },
+  })
+
+  /**
+   * 领域管理（schema v14）：查看领域清点、登记领域 mission/触发词、重标单条记忆的领域。
+   * 三种模式共用一条工具，避免工具表膨胀：
+   * - action=stats：列出各领域条目数（含 general）；
+   * - action=register：把 name + mission + triggers 写入 domains.json（覆盖同名）；
+   * - action=retag：把某条记忆改为 domain（传 'general' 表示改回通用）。
+   */
+  const domain = defineTool({
+    name: 'engram_domain',
+    description: message('tool.domainDescription'),
+    parameters: {
+      action: { type: 'string', enum: ['stats', 'register', 'retag'], required: true, description: message('tool.domainActionDescription') },
+      name: { type: 'string', description: message('tool.domainNameDescription') },
+      mission: { type: 'string', description: message('tool.domainMissionDescription') },
+      triggers: { type: 'array', items: { type: 'string' }, description: message('tool.domainTriggersDescription') },
+      id: { type: 'string', description: message('tool.domainIdDescription') },
+      domain: { type: 'string', description: message('tool.domainTagDescription') },
+      scope: { type: 'string', enum: ['user', 'project', 'shared'], description: message('tool.entryScopeDescription') },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: {
+        text: { type: 'string', required: true },
+      } },
+      render: (_args, value) => [{ type: 'text', text: value.text }],
+    },
+    async execute(args) {
+      const input = args as { action: string; name?: unknown; mission?: unknown; triggers?: unknown; id?: unknown; domain?: unknown; scope?: unknown }
+      if (input.action === 'stats') {
+        const store = await deps.openStore('user')
+        const counts = await store.domainCounts()
+        const registry = await loadDomainRegistry(deps.dbDir)
+        const descriptors = mergeDomainDescriptors(registry, counts)
+        if (descriptors.length === 0) return { text: message('tool.domainStatsEmpty') }
+        const lines = descriptors.map((d) => {
+          const triggerText = d.triggers === undefined || d.triggers.length === 0
+            ? message('tool.domainNoTriggers')
+            : d.triggers.join(' / ')
+          return message('tool.domainStatsLine', {
+            name: d.name,
+            count: String(d.count ?? 0),
+            mission: d.mission ?? '',
+            triggers: triggerText,
+          })
+        })
+        return { text: [message('tool.domainStatsHeader'), ...lines].join('\n') }
+      }
+      if (input.action === 'register') {
+        const name = domainOf(input.name)
+        if (name === undefined) throw new Error(message('tool.domainNameRequired'))
+        const registry = await loadDomainRegistry(deps.dbDir)
+        const mission = typeof input.mission === 'string' ? input.mission.trim() : undefined
+        const triggers = Array.isArray(input.triggers)
+          ? input.triggers.filter((t): t is string => typeof t === 'string' && t.trim() !== '').map(t => t.trim())
+          : undefined
+        const next = registry.filter(d => d.name !== name)
+        next.push({
+          name,
+          ...(mission === undefined || mission === '' ? {} : { mission }),
+          ...(triggers === undefined || triggers.length === 0 ? {} : { triggers }),
+        })
+        const path = await saveDomainRegistry(deps.dbDir, next)
+        return { text: message('tool.domainRegistered', { name, path }) }
+      }
+      // retag
+      const id = typeof input.id === 'string' ? input.id.trim() : ''
+      if (id === '') throw new Error(message('tool.domainIdRequired'))
+      const target = domainOf(input.domain) ?? 'general'
+      const scope = scopeOf(input.scope, 'user')
+      const store = await deps.openStore(scope)
+      const record = await store.setDomain(asMemoryId(id), target)
+      return { text: message('tool.domainRetagged', { id: record.id, domain: target }) }
     },
   })
 
@@ -1940,7 +2038,7 @@ export function createEngramTools(baseDeps: ToolDeps): ToolDefinition[] {
     },
   })
 
-  const tools = [save, search, factsTool, assess, timeline, episodeTimeline, update, forget, report, reviewQueue, review, stats, exportTool, distill, reflect, examine, neighborsTool, tour, auditForgotten, ingestHistory, profileEdit]
+  const tools = [save, search, factsTool, assess, timeline, episodeTimeline, update, forget, report, reviewQueue, review, stats, exportTool, distill, reflect, examine, neighborsTool, tour, auditForgotten, ingestHistory, profileEdit, domain]
   // 执行前把该会话的 cwd 放进 ALS 上下文：project scope 的分库解析据此归属（并发会话互不串味）。
   return tools.map(tool => ({
     ...tool,

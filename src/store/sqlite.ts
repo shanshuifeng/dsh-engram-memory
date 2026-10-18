@@ -31,7 +31,7 @@ import type { EngramStore, RoomState } from './interface.ts'
 
 /** 当前 schema 版本；结构性变更必须 +1。可空列与伴随表走增量迁移（见 openEngramStore 的迁移段）。
  *  v12→v13 是纯数据迁移（历史房名归一化），但同样借版本号作为「只跑一次」的开关。 */
-const SCHEMA_VERSION = 13
+const SCHEMA_VERSION = 14
 /** 增量迁移表：key 为起始版本，value 为升到下一版本的 SQL（可多语句）。
  *  v2 → v3：nodes 补可空列 outcome（使用效果回报）。
  *  v3 → v4：新增 nodes_revisions 修订表（update 归档旧条目时的内容快照）。
@@ -59,7 +59,11 @@ const SCHEMA_VERSION = 13
  *  v12 → v13：历史房名归一化——0.8.12 及更早把**显示名**写进 slot_room（「事实厅」），
  *   语言中立 id 启用后同一逻辑房会裂成两间（容量 9 变 18、tour_routes 按 room 断开）。
  *   升级时一次性改写为 id，含扩建房（「事实厅-2」→「fact-2」）；已经是 id 的库零行改动，
- *   SQL 自身幂等。手动脚本 scripts/migrate-room-ids.mjs 保留为兜底。 */
+ *   SQL 自身幂等。手动脚本 scripts/migrate-room-ids.mjs 保留为兜底。
+ *  v13 → v14：领域维度——nodes 补可空列 domain（知识方向：ue5/datamining/… 或 general），
+ *   并建 domain 索引。领域与 scope（哪个宫殿）、kind（什么类型）正交，用于检索收窄与
+ *   会话注入门控。存量条目一律置 NULL（= 按 general 处理，保持升级前的注入行为不变），
+ *   迁移不猜测分类，由人工或后续 engram_retag 归类。 */
 const MIGRATIONS: Readonly<Record<string, string>> = {
   '2': 'ALTER TABLE nodes ADD COLUMN outcome TEXT',
   '3': `CREATE TABLE IF NOT EXISTS nodes_revisions (
@@ -113,6 +117,10 @@ const MIGRATIONS: Readonly<Record<string, string>> = {
     UPDATE nodes SET slot_room = replace(slot_room, '决策堂', 'decision') WHERE slot_room LIKE '决策堂%';
     UPDATE nodes SET slot_room = replace(slot_room, '往事廊', 'episode') WHERE slot_room LIKE '往事廊%';
     UPDATE nodes SET slot_room = replace(slot_room, '技法坊', 'skill') WHERE slot_room LIKE '技法坊%';`,
+  // 领域维度：可空列 + 索引。存量条目保持 NULL（= general），升级后注入行为不变，
+  // 分类交给人工/engram_retag，迁移不做启发式猜测。
+  '13': `ALTER TABLE nodes ADD COLUMN domain TEXT;
+    CREATE INDEX IF NOT EXISTS nodes_domain ON nodes (domain, status);`,
 }
 /** RRF 融合常数：score = Σ 1/(K + rank)。 */
 const RRF_K = 60
@@ -156,6 +164,8 @@ interface NodeRow {
   ease_factor: number | null
   interval_days: number | null
   review_reps: number | null
+  /** 知识领域（schema v14）；NULL = 存量未分类，按 general 处理。 */
+  domain: string | null
 }
 
 /** 把意象铭牌序列化为 JSON（缺省序列化为 null，落库）。 */
@@ -193,6 +203,7 @@ function rowToRecord(row: NodeRow): MemoryRecord {
     scope: row.scope as EngramScope,
     kind: row.kind as MemoryRecord['kind'],
     content: row.content,
+    ...(row.domain === null || row.domain === '' ? {} : { domain: row.domain }),
     importance: row.importance,
     confidence: row.confidence,
     status: row.status as MemoryRecord['status'],
@@ -407,7 +418,7 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
       imagery_json TEXT,
       slot_room TEXT, slot_index INTEGER, imagery_score REAL,
       next_review_at INTEGER, ease_factor REAL, interval_days REAL,
-      review_reps INTEGER DEFAULT 0);
+      review_reps INTEGER DEFAULT 0, domain TEXT);
     CREATE TABLE IF NOT EXISTS edges (
       from_id TEXT NOT NULL, to_id TEXT NOT NULL, type TEXT NOT NULL, created_at INTEGER NOT NULL,
       PRIMARY KEY (from_id, to_id, type));
@@ -506,8 +517,8 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
   const sqlInsert = db.prepare(`INSERT INTO nodes
     (id, scope, kind, content, importance, confidence, status, created_at, last_accessed_at, access_count,
      source_session_id, source_round, source_seq, embedding, imagery_json,
-     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+     slot_room, slot_index, imagery_score, next_review_at, ease_factor, interval_days, domain)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const sqlFtsInsert = db.prepare('INSERT INTO nodes_fts (node_id, content) VALUES (?, ?)')
   const sqlSetStatus = db.prepare('UPDATE nodes SET status = ?, last_accessed_at = ? WHERE id = ?')
   const sqlSetOutcome = db.prepare(`UPDATE nodes
@@ -623,25 +634,43 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
   const sqlObservationActiveVectors = db.prepare('SELECT * FROM observations WHERE status != \'refuted\' AND embedding IS NOT NULL')
   const sqlPurgeObservations = db.prepare('DELETE FROM observations')
 
-  /** FTS 道：按 scope 集合检索（占位符动态生成，scope 集合由调用方去重）；rooms 非空时只查指定房间。 */
-  const ftsSearch = (match: string, scopes: readonly EngramScope[], rooms: readonly string[] | undefined): NodeRow[] => {
+  /**
+   * 领域过滤条件（schema v14）：domains 非空时只保留指定领域。
+   * 语义要点：`general`（含 NULL 存量条目）永远通过——通用知识对所有方向都成立，
+   * 若把它也过滤掉，用户工作方式偏好这类跨域条目会在任何领域检索中消失。
+   * @param prefix - 列名限定前缀（如 'n.'），无别名查询传空串。
+   * @returns SQL 片段与按序绑定的参数。
+   */
+  const domainCond = (domains: readonly string[] | undefined, prefix = ''): { sql: string; params: string[] } => {
+    if (domains === undefined || domains.length === 0) return { sql: '', params: [] }
+    const ph = domains.map(() => '?').join(',')
+    return {
+      sql: ` AND (${prefix}domain IN (${ph}) OR ${prefix}domain IS NULL OR ${prefix}domain = '' OR ${prefix}domain = 'general')`,
+      params: [...domains],
+    }
+  }
+
+  /** FTS 道：按 scope 集合检索（占位符动态生成，scope 集合由调用方去重）；rooms/domains 非空时收窄。 */
+  const ftsSearch = (match: string, scopes: readonly EngramScope[], rooms: readonly string[] | undefined, domains?: readonly string[]): NodeRow[] => {
     const placeholders = scopes.map(() => '?').join(',')
     const roomCond = rooms === undefined || rooms.length === 0
       ? ''
       : ` AND n.slot_room IN (${rooms.map(() => '?').join(',')})`
+    const d = domainCond(domains, 'n.')
     return db.prepare(`SELECT n.* FROM nodes_fts f JOIN nodes n ON n.id = f.node_id
-      WHERE nodes_fts MATCH ? AND n.status = 'active' AND n.scope IN (${placeholders})${roomCond}
-      ORDER BY bm25(nodes_fts) LIMIT ${RANK_POOL}`).all(match, ...scopes, ...(rooms ?? [])) as unknown as NodeRow[]
+      WHERE nodes_fts MATCH ? AND n.status = 'active' AND n.scope IN (${placeholders})${roomCond}${d.sql}
+      ORDER BY bm25(nodes_fts) LIMIT ${RANK_POOL}`).all(match, ...scopes, ...(rooms ?? []), ...d.params) as unknown as NodeRow[]
   }
 
-  /** 向量候选池：active 且带向量的条目，按 scope 集合过滤（占位符动态生成）；rooms 非空时只查指定房间。 */
-  const vectorPool = (scopes: readonly EngramScope[], rooms: readonly string[] | undefined): NodeRow[] => {
+  /** 向量候选池：active 且带向量的条目，按 scope 集合过滤（占位符动态生成）；rooms/domains 非空时收窄。 */
+  const vectorPool = (scopes: readonly EngramScope[], rooms: readonly string[] | undefined, domains?: readonly string[]): NodeRow[] => {
     const placeholders = scopes.map(() => '?').join(',')
     const roomCond = rooms === undefined || rooms.length === 0
       ? ''
       : ` AND slot_room IN (${rooms.map(() => '?').join(',')})`
-    return db.prepare(`SELECT * FROM nodes WHERE status = 'active' AND embedding IS NOT NULL AND scope IN (${placeholders})${roomCond}`)
-      .all(...scopes, ...(rooms ?? [])) as unknown as NodeRow[]
+    const d = domainCond(domains)
+    return db.prepare(`SELECT * FROM nodes WHERE status = 'active' AND embedding IS NOT NULL AND scope IN (${placeholders})${roomCond}${d.sql}`)
+      .all(...scopes, ...(rooms ?? []), ...d.params) as unknown as NodeRow[]
   }
 
   const getRow = (id: string): NodeRow | undefined => sqlGet.get(id) as unknown as NodeRow | undefined
@@ -668,6 +697,7 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
       imageryToJson(imagery),
       input.slot?.room ?? null, input.slot?.index ?? null, input.imageryScore ?? null,
       initialReview, initialReview === null ? null : 2.5, initialReview === null ? null : 0,
+      input.domain ?? null,
     )
     sqlFtsInsert.run(id, tokenizeForFts(content))
     sqlLog.run(at, op, id, JSON.stringify({ kind: input.kind, scope: input.scope }))
@@ -792,7 +822,7 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
       // 道 1：FTS5 关键词（2-gram OR）。
       const match = ftsMatchExpression(query.text)
       if (match !== undefined) {
-        ftsSearch(match, query.scopes, query.rooms).forEach((row, index) => {
+        ftsSearch(match, query.scopes, query.rooms, query.domains).forEach((row, index) => {
           scores.set(row.id, { score: 1 / (RRF_K + index + 1), via: 'fts' })
         })
       }
@@ -801,7 +831,7 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
       let degraded = true
       if (queryVector !== undefined) {
         degraded = false
-        const pool = vectorPool(query.scopes, query.rooms)
+        const pool = vectorPool(query.scopes, query.rooms, query.domains)
         const ranked = pool
           .map(row => ({ row, sim: cosine(queryVector, blobToVec(row.embedding!)) }))
           .filter(entry => entry.sim >= MIN_COSINE)
@@ -985,7 +1015,13 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
         sqlLog.run(at, 'superseded', input.id, JSON.stringify({ supersededBy: id }))
         // 新条目是新物品：重新排桩/评分/排期（宫殿里修正一件物品 = 在新桩位放新版）。
         const imagery = input.imagery ?? jsonToImagery(old.imagery_json)
-        const updateInput: WriteInput = { scope: input.scope, kind: input.kind, content }
+        // 领域缺省继承旧条目：领域是分类属性，不应因内容修订而丢失。
+        const updateInput: WriteInput = {
+          scope: input.scope,
+          kind: input.kind,
+          content,
+          ...(input.domain !== undefined ? { domain: input.domain } : old.domain === null ? {} : { domain: old.domain }),
+        }
         const automationFields = applyWriteAutomation(updateInput, id, at, imagery)
         insertRecord(
           id,
@@ -1215,11 +1251,48 @@ export async function openEngramStore(path: string, rankBoost: RankBoostOptions 
       return rows.map(rowToRecord)
     },
 
+    /**
+     * 领域门控取件：注入候选按 activeDomains 过滤。
+     * general（含 NULL 存量条目）始终纳入——跨域通用记忆不参与门控。
+     * 超过 n 条时按 importance、confidence 倒序截断（与 topActive 同序）。
+     */
+    async topActiveByDomain(scope: EngramScope, n: number, activeDomains: readonly string[]) {
+      if (activeDomains.length === 0) return this.topActive(scope, n)
+      const d = domainCond(activeDomains)
+      const rows = db.prepare(`SELECT * FROM nodes WHERE scope = ? AND status = 'active'${d.sql}
+        ORDER BY importance DESC, confidence DESC LIMIT ?`)
+        .all(scope, ...d.params, n) as unknown as NodeRow[]
+      return rows.map(rowToRecord)
+    },
+
+    /** 领域重标：把既有条目的领域改为 domain（null = 改回 general）。返回受影响行数。 */
+    async setDomain(id: MemoryId, domain: string | null) {
+      const row = getRow(id)
+      if (row === undefined) throw new EngramError('NOT_FOUND', message('store.entryNotFound', { id }))
+      db.prepare('UPDATE nodes SET domain = ? WHERE id = ?').run(domain, id)
+      sqlLog.run(Date.now(), 'retag', id, JSON.stringify({ domain }))
+      return rowToRecord(sqlGet.get(id) as unknown as NodeRow)
+    },
+
+    /** 领域清点：各领域下 active 条目数（null 归入 general）。面板与规划用。 */
+    async domainCounts() {
+      const rows = db.prepare(`SELECT COALESCE(NULLIF(domain, ''), 'general') AS d, COUNT(*) AS n
+        FROM nodes WHERE status = 'active' GROUP BY d ORDER BY n DESC`).all() as unknown as { d: string; n: number }[]
+      const out: Record<string, number> = {}
+      for (const row of rows) out[row.d] = row.n
+      return out
+    },
+
     async list(filter: ListFilter): Promise<ListResult> {
       const conds: string[] = ['scope = ?']
       const params: (string | number)[] = [filter.scope]
       if (filter.status !== undefined) { conds.push('status = ?'); params.push(filter.status) }
       if (filter.kind !== undefined) { conds.push('kind = ?'); params.push(filter.kind) }
+      // 领域过滤：general 视为 NULL，故指定 'general' 时同时匹配 NULL/空串。
+      if (filter.domain !== undefined) {
+        if (filter.domain === 'general') conds.push("(domain IS NULL OR domain = '' OR domain = 'general')")
+        else { conds.push('domain = ?'); params.push(filter.domain) }
+      }
       if (filter.q !== undefined && filter.q !== '') { conds.push('instr(content, ?) > 0'); params.push(filter.q) }
       // 脱敏标记过滤：标记格式由 redact.ts 固定（[REDACTED:<类型>]），LIKE 字面匹配。
       if (filter.redacted !== undefined) {

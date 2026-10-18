@@ -117,6 +117,16 @@ export interface EngramStore {
   restore(id: MemoryId): Promise<MemoryRecord>
   /** 画像注入/蒸馏取材：指定 scope 的 active 条目按 importance、confidence 倒序取前 n。 */
   topActive(scope: EngramScope, n: number): Promise<MemoryRecord[]>
+  /**
+   * 领域门控取材（schema v14）：只取 activeDomains 命中的 active 条目；
+   * general（含未分类的 NULL 存量条目）始终纳入，不参与门控。
+   * activeDomains 为空时等价 topActive（不过滤）。
+   */
+  topActiveByDomain(scope: EngramScope, n: number, activeDomains: readonly string[]): Promise<MemoryRecord[]>
+  /** 领域重标：把条目领域改为 domain（null = 改回 general），返回更新后的条目。 */
+  setDomain(id: MemoryId, domain: string | null): Promise<MemoryRecord>
+  /** 各领域 active 条目数（未分类归入 general）。 */
+  domainCounts(): Promise<Record<string, number>>
   /** 管理列表：按 scope/status/kind/子串过滤的分页视图（含全部状态），附总数。 */
   list(filter: ListFilter): Promise<ListResult>
   /** 审计视图：条目 + supersedes/contradicts/related 邻居 + 修订历史 + 最近操作日志。 */
