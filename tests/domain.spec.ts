@@ -162,6 +162,18 @@ describe('领域收窄检索', () => {
     expect(contents).toContain('通用偏好')
     expect(contents).not.toContain('ml 内容')
   })
+
+  it('未激活任何领域时只取 general（不回退全量）', async () => {
+    // 锁死门控的核心语义：无关会话不该看到任何方向的专业记忆。
+    // 早期实现错误地在 active 为空时回退 topActive()，导致门控形同虚设。
+    await store.write({ scope: 'user', kind: 'skill', content: 'ue5 内容', domain: 'ue5', importance: 0.9 })
+    await store.write({ scope: 'user', kind: 'skill', content: 'ml 内容', domain: 'ml', importance: 0.9 })
+    await store.write({ scope: 'user', kind: 'preference', content: '通用偏好', importance: 0.9 })
+    // 传 ['general'] 模拟「门控开但未命中」的调用约定
+    const rows = await store.topActiveByDomain('user', 10, ['general'])
+    const contents = rows.map(r => r.content)
+    expect(contents).toEqual(['通用偏好'])
+  })
 })
 
 describe('领域注册表', () => {

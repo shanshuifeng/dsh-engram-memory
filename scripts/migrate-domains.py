@@ -3,6 +3,12 @@
 
 前置：DSH 已重启，插件已完成 v14 迁移（nodes 表有 domain 列）。
 安全：写操作前自动备份；只改 domain 列，不动内容/状态/复习排期。
+
+分类策略（两阶段，避免泛化线索吞掉明确领域）：
+1. 强通用信号：工作方式类偏好（跨域适用）——优先级最高，因为这类内容
+   常含「插件」「记忆」等会把它们拖进某个方向的词。
+2. 领域规则：专有名词/技术术语命中。
+3. 兜底 general：宁可留在常驻层，也不误分到不会激活的方向。
 """
 import sqlite3
 import os
@@ -16,32 +22,34 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 BASE = r"C:\Users\Administrator\.dsh\engram"
 
-# 领域判定规则：(domain, 关键词)。按顺序匹配，先命中者胜。
-# 顺序很重要：专有名词强的在前，泛化的在后。
+# 强通用信号：出现即判 general，且优先于领域规则。
+# 只收「明确是跨域工作方式」的短语，不收「用户要求」「用户偏好」这类泛化开头。
+STRONG_GENERAL = [
+    "用户工作方式", "用户选装", "只装真实增量", "重大操作（装插件",
+    "回答尽量简洁", "先联网查询", "不允许凭记忆瞎猜",
+    "winget 安装", "披露偏好", "记忆维护节奏", "人机分工",
+    "浏览器时区", "所在时区", "未标明时区",
+]
+
+# 领域规则：(domain, 关键词)。术语越专有越靠前。
 RULES = [
     ("ue5", ["UE5", "UE 5", "虚幻", "Unreal", "uproject", "PythonScriptPlugin",
              "remote_execution", "K2Node", "蓝图", "BlueprintEditorUtils", "L4Builder",
              "SetStaticMesh", "FKismetEditorUtilities", "SCS 双根", "Actor 变换",
-             "关卡", "RemoteControlAPI", "编辑器世界"]),
+             "RemoteControlAPI", "编辑器世界", "关卡"]),
     ("uml", ["Enterprise Architect", "活动图", "顺序图", "用例图", "UML", ".qea",
              "SequenceNo", "PDATA", "组合片段", "教材订购系统", "t_connectorconstraint"]),
-    ("datamining", ["数据挖掘", "爬虫", "PyMuPDF", "scrapy", "selenium",
-                    "BeautifulSoup", "特征工程", "sklearn"]),
-    ("ml", ["机器学习", "神经网络", "embedding 模型", "向量检索", "fine-tune",
+    ("datamining", ["爬虫", "scrapy", "selenium", "BeautifulSoup", "特征工程",
+                    "sklearn", "数据清洗", "数据集移入", "PyMuPDF"]),
+    ("ml", ["机器学习", "神经网络", "向量检索", "embedding 模型", "fine-tune",
             "transformers", "Hindsight", "Mem0", "记忆系统"]),
-    ("dsh", ["dsh-", "DSH", "cordis", "engram_", "harness", "插件配置", "profile"]),
-]
-
-# 跨领域通用：工作方式偏好、工具选型铁律、记忆维护纪律
-GENERAL_HINTS = [
-    "用户要求", "用户偏好", "用户工作方式", "用户选装", "偏好：",
-    "只装真实增量", "重大操作", "回答尽量简洁", "先联网", "winget",
-    "披露偏好", "记忆维护", "闭环", "人机分工",
+    ("dsh", ["DSH", "dsh-", "cordis", "engram_", "harness", "profile 安装",
+             "插件安装", "MCP", "workbuddy"]),
 ]
 
 
 def classify(content):
-    for hint in GENERAL_HINTS:
+    for hint in STRONG_GENERAL:
         if hint in content:
             return "general", f"通用:{hint}"
     low = content.lower()
@@ -57,7 +65,6 @@ def main(apply=False):
     for p in glob.glob(os.path.join(BASE, "project-*.db")):
         targets[os.path.basename(p)] = "project"
 
-    # 备份
     if apply:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         bak = os.path.join(BASE, f"pre-domain-migration-{ts}")
@@ -69,6 +76,7 @@ def main(apply=False):
     total = 0
     changed = 0
     dist = {}
+    skipped = []
     for fname, scope in sorted(targets.items()):
         path = os.path.join(BASE, fname)
         if not os.path.exists(path):
@@ -76,7 +84,7 @@ def main(apply=False):
         c = sqlite3.connect(path)
         cols = [r[1] for r in c.execute("PRAGMA table_info(nodes)")]
         if "domain" not in cols:
-            print(f"[{fname}] 尚无 domain 列 —— 请先重启 DSH 让插件跑 v14 迁移")
+            skipped.append(fname)
             c.close()
             continue
         rows = c.execute(
@@ -105,6 +113,8 @@ def main(apply=False):
     for d, n in sorted(dist.items(), key=lambda kv: -kv[1]):
         print(f"  {d:12s} {n}")
     print(f"  合计 {total}")
+    if skipped:
+        print(f"\n未迁移（仍是 v13，将在首次访问时自动升级）：{', '.join(skipped)}")
     if apply:
         print(f"\n已写入 {changed} 条")
     else:

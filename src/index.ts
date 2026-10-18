@@ -344,14 +344,26 @@ async function preStep(
   // curated block：engram_profile_edit 维护的画像段，优先于自动派生画像注入。
   const curated = await store.getProfileBlock('user')
   // 领域门控（schema v14）：先按当前请求判定激活哪些方向，再决定注入哪些条目。
-  // 关闭门控（默认）时 activeDomains 为空 → 走 topActive，行为与升级前完全一致。
+  //
+  // 三态语义（门控关 / 开且命中 / 开但未命中）：
+  // - 关（默认）：走 topActive 全量，行为与升级前逐字节一致；
+  // - 开且命中：只注入命中方向 + general；
+  // - 开但未命中：只注入 general（**不回退全量**）。这是门控存在的意义——若未命中
+  //   就退回全量，任何无关请求都会把各方向记忆灌进上下文，门控等于没做。
+  //   模型仍可通过 engram_search 的 domains 参数主动拉取任意方向。
   const counts = await store.domainCounts()
   const registry = await loadDomainRegistry(resolved.dbDir)
   const descriptors = mergeDomainDescriptors(registry, counts)
   const gate = gateDomains(currentUserRequestText(decision.messages), descriptors, resolved.domainGating)
-  const top = gate.active.length === 0
-    ? await store.topActive('user', resolved.profileTopN)
-    : await store.topActiveByDomain('user', resolved.profileTopN, gate.active)
+  const top = resolved.domainGating
+    ? await store.topActiveByDomain(
+        'user',
+        resolved.profileTopN,
+        // 未命中时传 ['general']：domainCond 对 general 的放行条件恰好使之只匹配
+        // 未分类/通用条目，从而做到「无关会话只带通用记忆」。
+        gate.active.length === 0 ? ['general'] : gate.active,
+      )
+    : await store.topActive('user', resolved.profileTopN)
   if (top.length === 0 && curated === undefined) {
     // 领域门控把候选清空时也不能整体跳过：目录行仍需注入，否则模型永远不知道
     // 存在哪些方向（L1 目录是门控可用性的前提）。仅在确实无任何领域条目时早退。
